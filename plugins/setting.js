@@ -10,8 +10,12 @@ cmd({
     category: "owner",
     filename: __filename
 },
-async(conn, mek, m,{ isOwner, isMe, reply }) => {
+async(conn, mek, m,{ isOwner, reply, sender }) => {
 try{
+    // Get bot's number from conn
+    const botNumber = conn.user.id.split(':')[0] + '@s.whatsapp.net';
+    const isMe = sender === botNumber;
+    
     if (!isOwner && !isMe) return reply("*Owner only command ❌*")
     await updfb()
     await updb()
