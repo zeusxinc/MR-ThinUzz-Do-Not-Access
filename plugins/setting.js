@@ -10,9 +10,9 @@ cmd({
     category: "owner",
     filename: __filename
 },
-async(conn, mek, m,{ isOwner, reply }) => {
+async(conn, mek, m,{ isOwner, isMe, reply }) => {
 try{
-    if (!isOwner) return reply("*Owner only command ❌*")
+    if (!isOwner && !isMe) return reply("*Owner only command ❌*")
     await updfb()
     await updb()
     return reply("*Database reseted & reloaded ✅*")
