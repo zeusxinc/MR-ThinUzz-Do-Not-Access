@@ -77,9 +77,13 @@ const pendingConnections = new Map();
 const eventHandlersStore = new Map();
 const otpStore = new Map();
 const commandCache = new Map();
-
-// ===== CACHE =====
 const userConfigCache = new Map();
+
+// ===== MONGO CONNECTION =====
+let mongoClient, mongoDB;
+let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
+let mongoConnectionAttempts = 0;
+const MAX_MONGO_RETRIES = 5;
 
 async function getCachedUserConfig(number) {
   const now = Date.now();
@@ -115,27 +119,28 @@ function loadPlugins() {
         }}}
 loadPlugins();
 
-// ---------------- MONGO SETUP ----------------
-let mongoClient, mongoDB;
-let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
-
+// ---------------- MONGO SETUP WITH RETRY ----------------
 async function initMongo() {
   try {
     if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected && mongoClient.topology.isConnected()) {
       return mongoClient;
     }
+    
     if (mongoClient && !mongoClient.topology?.isConnected?.()) {
       try { await mongoClient.close(); } catch(e) {}
       mongoClient = null;
     }
     
+    console.log('🔄 Connecting to MongoDB...');
     mongoClient = new MongoClient(MONGO_URI, { 
       useNewUrlParser: true, 
       useUnifiedTopology: true, 
       maxPoolSize: 50,
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 10000,
       socketTimeoutMS: 45000,
+      connectTimeoutMS: 10000,
     });
+    
     await mongoClient.connect();
     mongoDB = mongoClient.db(MONGO_DB);
 
@@ -151,11 +156,22 @@ async function initMongo() {
     await newsletterCol.createIndex({ jid: 1 }, { unique: true });
     await newsletterReactsCol.createIndex({ jid: 1 }, { unique: true });
     await configsCol.createIndex({ number: 1 }, { unique: true });
-    console.log('✅ Mongo initialized and collections ready');
+    
+    console.log('✅ MongoDB connected successfully!');
+    mongoConnectionAttempts = 0;
     return mongoClient;
+    
   } catch (e) { 
-    console.error('MongoDB error:', e); 
-    throw e;
+    console.error('❌ MongoDB connection error:', e.message);
+    mongoConnectionAttempts++;
+    
+    if (mongoConnectionAttempts < MAX_MONGO_RETRIES) {
+      console.log(`🔄 Retrying MongoDB connection (${mongoConnectionAttempts}/${MAX_MONGO_RETRIES})...`);
+      await delay(5000 * mongoConnectionAttempts);
+      return initMongo();
+    }
+    
+    throw new Error(`Failed to connect to MongoDB after ${MAX_MONGO_RETRIES} attempts`);
   }
 }
 
@@ -166,8 +182,8 @@ async function saveCredsToMongo(number, creds, keys = null) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const doc = { number: sanitized, creds, keys, updatedAt: new Date() };
     await sessionsCol.updateOne({ number: sanitized }, { $set: doc }, { upsert: true });
-    console.log(`Saved creds to Mongo for ${sanitized}`);
-  } catch (e) { console.error('saveCredsToMongo error:', e); }
+    console.log(`✅ Saved creds to Mongo for ${sanitized}`);
+  } catch (e) { console.error('❌ saveCredsToMongo error:', e); }
 }
 
 async function loadCredsFromMongo(number) {
@@ -176,7 +192,7 @@ async function loadCredsFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const doc = await sessionsCol.findOne({ number: sanitized });
     return doc || null;
-  } catch (e) { console.error('loadCredsFromMongo error:', e); return null; }
+  } catch (e) { console.error('❌ loadCredsFromMongo error:', e); return null; }
 }
 
 async function removeSessionFromMongo(number) {
@@ -184,8 +200,8 @@ async function removeSessionFromMongo(number) {
     await initMongo();
     const sanitized = number.replace(/[^0-9]/g, '');
     await sessionsCol.deleteOne({ number: sanitized });
-    console.log(`Removed session from Mongo for ${sanitized}`);
-  } catch (e) { console.error('removeSessionToMongo error:', e); }
+    console.log(`✅ Removed session from Mongo for ${sanitized}`);
+  } catch (e) { console.error('❌ removeSessionToMongo error:', e); }
 }
 
 async function addNumberToMongo(number) {
@@ -193,8 +209,8 @@ async function addNumberToMongo(number) {
     await initMongo();
     const sanitized = number.replace(/[^0-9]/g, '');
     await numbersCol.updateOne({ number: sanitized }, { $set: { number: sanitized, updatedAt: new Date() } }, { upsert: true });
-    console.log(`Added number ${sanitized} to Mongo numbers`);
-  } catch (e) { console.error('addNumberToMongo', e); }
+    console.log(`✅ Added number ${sanitized} to Mongo numbers`);
+  } catch (e) { console.error('❌ addNumberToMongo', e); }
 }
 
 async function removeNumberFromMongo(number) {
@@ -202,8 +218,8 @@ async function removeNumberFromMongo(number) {
     await initMongo();
     const sanitized = number.replace(/[^0-9]/g, '');
     await numbersCol.deleteOne({ number: sanitized });
-    console.log(`Removed number ${sanitized} from Mongo numbers`);
-  } catch (e) { console.error('removeNumberFromMongo', e); }
+    console.log(`✅ Removed number ${sanitized} from Mongo numbers`);
+  } catch (e) { console.error('❌ removeNumberFromMongo', e); }
 }
 
 async function getAllNumbersFromMongo() {
@@ -211,7 +227,7 @@ async function getAllNumbersFromMongo() {
     await initMongo();
     const docs = await numbersCol.find({}).toArray();
     return docs.map(d => d.number);
-  } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
+  } catch (e) { console.error('❌ getAllNumbersFromMongo', e); return []; }
 }
 
 async function loadAdminsFromMongo() {
@@ -219,7 +235,7 @@ async function loadAdminsFromMongo() {
     await initMongo();
     const docs = await adminsCol.find({}).toArray();
     return docs.map(d => d.jid || d.number).filter(Boolean);
-  } catch (e) { console.error('loadAdminsFromMongo', e); return []; }
+  } catch (e) { console.error('❌ loadAdminsFromMongo', e); return []; }
 }
 
 async function addAdminToMongo(jidOrNumber) {
@@ -227,16 +243,16 @@ async function addAdminToMongo(jidOrNumber) {
     await initMongo();
     const doc = { jid: jidOrNumber, updatedAt: new Date() };
     await adminsCol.updateOne({ jid: jidOrNumber }, { $set: doc }, { upsert: true });
-    console.log(`Added admin ${jidOrNumber}`);
-  } catch (e) { console.error('addAdminToMongo', e); }
+    console.log(`✅ Added admin ${jidOrNumber}`);
+  } catch (e) { console.error('❌ addAdminToMongo', e); }
 }
 
 async function removeAdminFromMongo(jidOrNumber) {
   try {
     await initMongo();
     await adminsCol.deleteOne({ jid: jidOrNumber });
-    console.log(`Removed admin ${jidOrNumber}`);
-  } catch (e) { console.error('removeAdminFromMongo', e); }
+    console.log(`✅ Removed admin ${jidOrNumber}`);
+  } catch (e) { console.error('❌ removeAdminFromMongo', e); }
 }
 
 async function addNewsletterToMongo(jid, emojis = []) {
@@ -244,16 +260,16 @@ async function addNewsletterToMongo(jid, emojis = []) {
     await initMongo();
     const doc = { jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date() };
     await newsletterCol.updateOne({ jid }, { $set: doc }, { upsert: true });
-    console.log(`Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
+    console.log(`✅ Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
+  } catch (e) { console.error('❌ addNewsletterToMongo', e); throw e; }
 }
 
 async function removeNewsletterFromMongo(jid) {
   try {
     await initMongo();
     await newsletterCol.deleteOne({ jid });
-    console.log(`Removed newsletter ${jid}`);
-  } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
+    console.log(`✅ Removed newsletter ${jid}`);
+  } catch (e) { console.error('❌ removeNewsletterFromMongo', e); throw e; }
 }
 
 async function listNewslettersFromMongo() {
@@ -261,7 +277,7 @@ async function listNewslettersFromMongo() {
     await initMongo();
     const docs = await newsletterCol.find({}).toArray();
     return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { console.error('listNewslettersFromMongo', e); return []; }
+  } catch (e) { console.error('❌ listNewslettersFromMongo', e); return []; }
 }
 
 async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
@@ -271,8 +287,8 @@ async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
     if (!mongoDB) await initMongo();
     const col = mongoDB.collection('newsletter_reactions_log');
     await col.insertOne(doc);
-    console.log(`Saved reaction ${emoji} for ${jid}#${messageId}`);
-  } catch (e) { console.error('saveNewsletterReaction', e); }
+    console.log(`✅ Saved reaction ${emoji} for ${jid}#${messageId}`);
+  } catch (e) { console.error('❌ saveNewsletterReaction', e); }
 }
 
 async function setUserConfigInMongo(number, conf) {
@@ -281,7 +297,8 @@ async function setUserConfigInMongo(number, conf) {
     const sanitized = number.replace(/[^0-9]/g, '');
     await configsCol.updateOne({ number: sanitized }, { $set: { number: sanitized, config: conf, updatedAt: new Date() } }, { upsert: true });
     userConfigCache.delete(sanitized);
-  } catch (e) { console.error('setUserConfigInMongo', e); }
+    console.log(`✅ Updated config for ${sanitized}`);
+  } catch (e) { console.error('❌ setUserConfigInMongo', e); }
 }
 
 async function loadUserConfigFromMongo(number) {
@@ -290,23 +307,23 @@ async function loadUserConfigFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const doc = await configsCol.findOne({ number: sanitized });
     return doc ? doc.config : null;
-  } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
+  } catch (e) { console.error('❌ loadUserConfigFromMongo', e); return null; }
 }
 
 async function addNewsletterReactConfig(jid, emojis = []) {
   try {
     await initMongo();
     await newsletterReactsCol.updateOne({ jid }, { $set: { jid, emojis, addedAt: new Date() } }, { upsert: true });
-    console.log(`Added react-config for ${jid} -> ${emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterReactConfig', e); throw e; }
+    console.log(`✅ Added react-config for ${jid} -> ${emojis.join(',')}`);
+  } catch (e) { console.error('❌ addNewsletterReactConfig', e); throw e; }
 }
 
 async function removeNewsletterReactConfig(jid) {
   try {
     await initMongo();
     await newsletterReactsCol.deleteOne({ jid });
-    console.log(`Removed react-config for ${jid}`);
-  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+    console.log(`✅ Removed react-config for ${jid}`);
+  } catch (e) { console.error('❌ removeNewsletterReactConfig', e); throw e; }
 }
 
 async function listNewsletterReactsFromMongo() {
@@ -314,7 +331,7 @@ async function listNewsletterReactsFromMongo() {
     await initMongo();
     const docs = await newsletterReactsCol.find({}).toArray();
     return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
+  } catch (e) { console.error('❌ listNewsletterReactsFromMongo', e); return []; }
 }
 
 function formatMessage(title, content, footer) {
@@ -395,8 +412,8 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
 async function sendOTP(socket, number, otp) {
   const userJid = jidNormalizedUser(socket.user.id);
   const message = formatMessage(`*🔐 Otp Veryfication — ${BOT_NAME_FANCY}*`, `*𝐘𝚄𝚁 𝐎𝚃𝙿 𝐅𝙾𝚁 𝐂𝙾𝙽𝙵𝙸𝙶 𝐔𝙿𝙳𝙰𝚃𝙴 𝐈𝚂:* *${otp}*\n𝐓𝙷𝙸𝚂 𝐎𝚃𝙿 𝐖𝙸𝙻𝙻 𝐄𝚇𝙿𝙸𝚁𝙴 𝐈𝙽 5 𝐌𝙸𝙽𝚄𝚃𝙴𝚂.\n\n*𝐍𝚄𝙼𝙱𝙴𝚁:* ${number}`, BOT_NAME_FANCY);
-  try { await socket.sendMessage(userJid, { text: message }); console.log(`OTP ${otp} sent to ${number}`); }
-  catch (error) { console.error(`Failed to send OTP to ${number}:`, error); throw error; }
+  try { await socket.sendMessage(userJid, { text: message }); console.log(`✅ OTP ${otp} sent to ${number}`); }
+  catch (error) { console.error(`❌ Failed to send OTP to ${number}:`, error); throw error; }
 }
 
 // ==================== FAST SYNC MESSAGE EXTRACTOR ====================
@@ -423,9 +440,11 @@ function extractMessageBodySync(msg) {
   } catch (err) { return ''; }
 }
 
-// ==================== OPTIMIZED COMMAND HANDLER ====================
+// ==================== COMMAND HANDLER ====================
+const { findCommand } = require('./lib/commandMap');
+const { commands } = require('./lib/command');
+
 function setupCommandHandlers(socket, number) {
-  // Remove existing handler
   if (eventHandlersStore.has(`cmd_${number}`)) {
     const oldHandler = eventHandlersStore.get(`cmd_${number}`);
     socket.ev.off('messages.upsert', oldHandler);
@@ -451,7 +470,6 @@ function setupCommandHandlers(socket, number) {
       const cleanOwner = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
       const isOwner = cleanSender === cleanOwner;
 
-      // FAST: Extract body synchronously
       const body = extractMessageBodySync(msg);
       if (!body) return;
 
@@ -469,13 +487,11 @@ function setupCommandHandlers(socket, number) {
       // Send typing indicator IMMEDIATELY
       socket.sendPresenceUpdate('composing', from).catch(() => {});
 
-      // Create reply function
       const reply = (text, opt = {}) => {
         return socket.sendMessage(from, { text, ...opt }, { quoted: msg })
           .catch(err => console.error('Reply error:', err));
       };
 
-      // Execute command with timeout
       const commandPromise = cmdData.function(socket, msg, null, {
         from, prefix, body, command, args, q: args.join(' '),
         isGroup, isOwner, sender, senderNumber, 
@@ -491,7 +507,6 @@ function setupCommandHandlers(socket, number) {
 
       Promise.race([commandPromise, timeoutPromise])
         .then(() => {
-          // Clear typing when done
           socket.sendPresenceUpdate('paused', from).catch(() => {});
         })
         .catch((err) => {
@@ -588,7 +603,7 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
           } else {
             await socket.sendMessage(jid, { react: { text: emoji, key: message.key } });
           }
-          console.log(`Reacted to ${jid} ${messageId} with ${emoji}`);
+          console.log(`✅ Reacted to ${jid} ${messageId} with ${emoji}`);
           await saveNewsletterReaction(jid, messageId.toString(), emoji, sessionNumber || null);
           break;
         } catch (err) {
@@ -752,8 +767,8 @@ async function setupAutoMessageRead(socket, sessionNumber) {
 
 // ==================== MESSAGE HANDLERS ====================
 async function setupMessageHandlers(socket, sessionNumber) {
-  if (eventHandlersStore.has(`typing_${sessionNumber}`)) {
-    const oldHandler = eventHandlersStore.get(`typing_${sessionNumber}`);
+  if (eventHandlersStore.has(`msg_${sessionNumber}`)) {
+    const oldHandler = eventHandlersStore.get(`msg_${sessionNumber}`);
     socket.ev.off('messages.upsert', oldHandler);
   }
 
@@ -784,14 +799,13 @@ async function setupMessageHandlers(socket, sessionNumber) {
   };
   
   socket.ev.on('messages.upsert', msgHandler);
-  eventHandlersStore.set(`typing_${sessionNumber}`, msgHandler);
+  eventHandlersStore.set(`msg_${sessionNumber}`, msgHandler);
 }
 
 // ==================== CLEANUP ====================
 async function deleteSessionAndCleanup(number, socketInstance) {
   const sanitized = number.replace(/[^0-9]/g, '');
   try {
-    // Remove all event handlers
     const handlersToRemove = [];
     for (const [key] of eventHandlersStore.entries()) {
       if (key.includes(sanitized)) {
@@ -819,8 +833,8 @@ async function deleteSessionAndCleanup(number, socketInstance) {
       const caption = formatMessage('*🥷 OWNER NOTICE — SESSION REMOVED*', `*𝐍umber:* ${sanitized}\n*𝐒ession 𝐑emoved 𝐃ue 𝐓o 𝐋ogout.*\n\n*𝐀ctive 𝐒essions 𝐍ow:* ${activeSockets.size}`, BOT_NAME_FANCY);
       if (socketInstance && socketInstance.sendMessage) await socketInstance.sendMessage(ownerJid, { image: { url: config.IMAGE_PATH }, caption });
     } catch(e){}
-    console.log(`Cleanup completed for ${sanitized}`);
-  } catch (err) { console.error('deleteSessionAndCleanup error:', err); }
+    console.log(`✅ Cleanup completed for ${sanitized}`);
+  } catch (err) { console.error('❌ deleteSessionAndCleanup error:', err); }
 }
 
 // ==================== AUTO-RESTART ====================
@@ -862,18 +876,31 @@ async function EmpirePair(number, res) {
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   
   if (pendingConnections.has(sanitizedNumber)) {
-    console.log(`Connection already in progress for ${sanitizedNumber}`);
+    console.log(`⏳ Connection already in progress for ${sanitizedNumber}`);
     return pendingConnections.get(sanitizedNumber);
   }
   
   if (activeSockets.has(sanitizedNumber)) {
-    console.log(`Already connected for ${sanitizedNumber}`);
+    console.log(`✅ Already connected for ${sanitizedNumber}`);
     return activeSockets.get(sanitizedNumber);
   }
   
   const promise = (async () => {
+    try {
+      await initMongo();
+    } catch (error) {
+      console.error('❌ MongoDB connection failed:', error.message);
+      if (!res.headersSent && res.status) {
+        res.status(503).json({ 
+          error: 'Service Unavailable', 
+          details: 'Database connection failed. Please try again later.',
+          code: 'DB_ERROR'
+        });
+      }
+      throw error;
+    }
+    
     const sessionPath = path.join(os.tmpdir(), `session_${sanitizedNumber}`);
-    await initMongo().catch(() => {});
 
     try {
       const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
@@ -881,9 +908,9 @@ async function EmpirePair(number, res) {
         await fs.ensureDir(sessionPath);
         await fs.writeFile(path.join(sessionPath, 'creds.json'), JSON.stringify(mongoDoc.creds, null, 2));
         if (mongoDoc.keys) await fs.writeFile(path.join(sessionPath, 'keys.json'), JSON.stringify(mongoDoc.keys, null, 2));
-        console.log('Prefilled creds from Mongo');
+        console.log('✅ Prefilled creds from Mongo');
       }
-    } catch (e) { console.warn('Prefill from Mongo failed', e); }
+    } catch (e) { console.warn('⚠️ Prefill from Mongo failed:', e.message); }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
@@ -905,15 +932,15 @@ async function EmpirePair(number, res) {
       socketCreationTime.set(sanitizedNumber, Date.now());
 
       // Setup handlers - ORDER MATTERS
-      await setupTypingIndicator(socket, sanitizedNumber); // FASTEST FIRST
-      await setupCommandHandlers(socket, sanitizedNumber);
-      await setupStatusHandlers(socket, sanitizedNumber);
-      await setupMessageHandlers(socket, sanitizedNumber);
-      await setupAutoRestart(socket, sanitizedNumber);
-      await setupNewsletterHandlers(socket, sanitizedNumber);
-      await handleMessageRevocation(socket, sanitizedNumber);
-      await setupAutoMessageRead(socket, sanitizedNumber);
-      await setupCallRejection(socket, sanitizedNumber);
+      setupTypingIndicator(socket, sanitizedNumber);
+      setupCommandHandlers(socket, sanitizedNumber);
+      setupStatusHandlers(socket, sanitizedNumber);
+      setupMessageHandlers(socket, sanitizedNumber);
+      setupAutoRestart(socket, sanitizedNumber);
+      setupNewsletterHandlers(socket, sanitizedNumber);
+      handleMessageRevocation(socket, sanitizedNumber);
+      setupAutoMessageRead(socket, sanitizedNumber);
+      setupCallRejection(socket, sanitizedNumber);
 
       if (!socket.authState.creds.registered) {
         let retries = config.MAX_RETRIES;
@@ -929,8 +956,8 @@ async function EmpirePair(number, res) {
             if (retries === 0) throw error;
           }
         }
-        if (!res.headersSent && res.send) {
-          res.send({ code });
+        if (!res.headersSent && res.json) {
+          res.json({ code });
         }
       }
 
@@ -956,7 +983,7 @@ async function EmpirePair(number, res) {
           const keysObj = state.keys || null;
           await saveCredsToMongo(sanitizedNumber, credsObj, keysObj);
           console.log('✅ Creds saved to MongoDB successfully');
-        } catch (err) { console.error('Failed saving creds on creds.update:', err); }
+        } catch (err) { console.error('❌ Failed saving creds on creds.update:', err); }
       };
       
       socket.ev.on('creds.update', credsHandler);
@@ -982,8 +1009,8 @@ async function EmpirePair(number, res) {
               }
             } catch (e) {}
             activeSockets.set(sanitizedNumber, socket);
-            const userConfig = await getCachedUserConfig(sanitizedNumber) || {};
             await addNumberToMongo(sanitizedNumber);
+            console.log(`✅ Bot connected for ${sanitizedNumber}`);
           } catch (e) { console.error('Connection open error:', e); }
         }
         if (connection === 'close') {
@@ -999,11 +1026,15 @@ async function EmpirePair(number, res) {
       return socket;
       
     } catch (error) {
-      console.error('Pairing error:', error);
+      console.error('❌ Pairing error:', error);
       socketCreationTime.delete(sanitizedNumber);
       pendingConnections.delete(sanitizedNumber);
       if (!res.headersSent && res.status) {
-        res.status(503).send({ error: 'Service Unavailable' });
+        res.status(503).json({ 
+          error: 'Service Unavailable', 
+          details: error.message || 'Failed to create session',
+          code: 'SESSION_ERROR'
+        });
       }
       throw error;
     }
@@ -1021,106 +1052,160 @@ async function EmpirePair(number, res) {
 // ==================== ENDPOINTS ====================
 router.post('/newsletter/add', async (req, res) => {
   const { jid, emojis } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  if (!jid.endsWith('@newsletter')) return res.status(400).send({ error: 'Invalid newsletter jid' });
-  try { await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []); res.status(200).send({ status: 'ok', jid }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  if (!jid) return res.status(400).json({ error: 'jid required' });
+  if (!jid.endsWith('@newsletter')) return res.status(400).json({ error: 'Invalid newsletter jid' });
+  try { await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []); res.status(200).json({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.post('/newsletter/remove', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  try { await removeNewsletterFromMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  if (!jid) return res.status(400).json({ error: 'jid required' });
+  try { await removeNewsletterFromMongo(jid); res.status(200).json({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.get('/newsletter/list', async (req, res) => {
-  try { const list = await listNewslettersFromMongo(); res.status(200).send({ status: 'ok', channels: list }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  try { const list = await listNewslettersFromMongo(); res.status(200).json({ status: 'ok', channels: list }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.post('/admin/add', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  try { await addAdminToMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  if (!jid) return res.status(400).json({ error: 'jid required' });
+  try { await addAdminToMongo(jid); res.status(200).json({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.post('/admin/remove', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  try { await removeAdminFromMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  if (!jid) return res.status(400).json({ error: 'jid required' });
+  try { await removeAdminFromMongo(jid); res.status(200).json({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.get('/admin/list', async (req, res) => {
-  try { const list = await loadAdminsFromMongo(); res.status(200).send({ status: 'ok', admins: list }); } 
-  catch (e) { res.status(500).send({ error: e.message || e }); }
+  try { const list = await loadAdminsFromMongo(); res.status(200).json({ status: 'ok', admins: list }); } 
+  catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 router.get('/', async (req, res) => {
   const { number } = req.query;
-  if (!number) return res.status(400).send({ error: 'Number parameter is required' });
+  if (!number) {
+    return res.status(400).json({ 
+      error: 'Number parameter is required',
+      code: 'MISSING_PARAM'
+    });
+  }
+  
   const sanitized = number.replace(/[^0-9]/g, '');
   
+  if (!sanitized || sanitized.length < 10) {
+    return res.status(400).json({ 
+      error: 'Invalid phone number format. Please enter a valid number.',
+      code: 'INVALID_NUMBER'
+    });
+  }
+  
   if (pendingConnections.has(sanitized)) {
-    return res.status(200).send({ status: 'connecting', message: 'Connection already in progress' });
+    return res.status(200).json({ 
+      status: 'connecting', 
+      message: 'Connection already in progress. Please wait...',
+      code: 'CONNECTING'
+    });
   }
   
   if (activeSockets.has(sanitized)) {
-    return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
+    return res.status(200).json({ 
+      status: 'already_connected', 
+      message: 'This number is already connected',
+      code: 'ALREADY_CONNECTED'
+    });
   }
   
   try {
     await EmpirePair(number, res);
   } catch (error) {
     if (!res.headersSent) {
-      res.status(500).send({ error: error.message || 'Connection failed' });
+      res.status(503).json({ 
+        error: 'Service Unavailable. Please try again later.',
+        details: error.message || 'Unknown error',
+        code: 'SERVICE_ERROR'
+      });
     }
   }
 });
 
 router.get('/active', (req, res) => {
-  res.status(200).send({ botName: BOT_NAME_FANCY, count: activeSockets.size, numbers: Array.from(activeSockets.keys()), timestamp: getSriLankaTimestamp() });
+  res.status(200).json({ 
+    botName: BOT_NAME_FANCY, 
+    count: activeSockets.size, 
+    numbers: Array.from(activeSockets.keys()), 
+    timestamp: getSriLankaTimestamp() 
+  });
 });
 
 router.get('/ping', (req, res) => {
-  res.status(200).send({ status: 'active', botName: BOT_NAME_FANCY, message: 'SHALA-MD-MINI-BOT', activesession: activeSockets.size });
+  res.status(200).json({ 
+    status: 'active', 
+    botName: BOT_NAME_FANCY, 
+    message: 'SHALA-MD-MINI-BOT', 
+    activesession: activeSockets.size 
+  });
+});
+
+router.get('/health', async (req, res) => {
+  try {
+    await initMongo();
+    res.status(200).json({ 
+      status: 'ok', 
+      mongodb: 'connected',
+      activeSessions: activeSockets.size,
+      pendingConnections: pendingConnections.size,
+      timestamp: getSriLankaTimestamp()
+    });
+  } catch (e) {
+    res.status(503).json({ 
+      status: 'error', 
+      mongodb: 'disconnected',
+      error: e.message 
+    });
+  }
 });
 
 router.get('/connect-all', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
-    if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No numbers found to connect' });
+    if (!numbers || numbers.length === 0) return res.status(404).json({ error: 'No numbers found to connect' });
     const results = [];
     for (const number of numbers) {
       const sanitized = number.replace(/[^0-9]/g, '');
       if (activeSockets.has(sanitized)) { results.push({ number, status: 'already_connected' }); continue; }
       if (pendingConnections.has(sanitized)) { results.push({ number, status: 'connection_in_progress' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+      const mockRes = { headersSent: false, json: () => {}, status: () => mockRes };
       await EmpirePair(number, mockRes);
       results.push({ number, status: 'connection_initiated' });
     }
-    res.status(200).send({ status: 'success', connections: results });
-  } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
+    res.status(200).json({ status: 'success', connections: results });
+  } catch (error) { console.error('Connect all error:', error); res.status(500).json({ error: 'Failed to connect all bots' }); }
 });
 
 router.get('/reconnect', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
-    if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No session numbers found in MongoDB' });
+    if (!numbers || numbers.length === 0) return res.status(404).json({ error: 'No session numbers found in MongoDB' });
     const results = [];
     for (const number of numbers) {
       const sanitized = number.replace(/[^0-9]/g, '');
       if (activeSockets.has(sanitized)) { results.push({ number, status: 'already_connected' }); continue; }
       if (pendingConnections.has(sanitized)) { results.push({ number, status: 'connection_in_progress' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+      const mockRes = { headersSent: false, json: () => {}, status: () => mockRes };
       try { await EmpirePair(number, mockRes); results.push({ number, status: 'connection_initiated' }); } 
       catch (err) { results.push({ number, status: 'failed', error: err.message }); }
       await delay(1000);
     }
-    res.status(200).send({ status: 'success', connections: results });
-  } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
+    res.status(200).json({ status: 'success', connections: results });
+  } catch (error) { console.error('Reconnect error:', error); res.status(500).json({ error: 'Failed to reconnect bots' }); }
 });
 
 // OTP Rate limiting
@@ -1128,58 +1213,57 @@ const otpRateLimit = new Map();
 
 router.get('/update-config', async (req, res) => {
   const { number, config: configString } = req.query;
-  if (!number || !configString) return res.status(400).send({ error: 'Number and config are required' });
+  if (!number || !configString) return res.status(400).json({ error: 'Number and config are required' });
   
-  // Rate limit
   const now = Date.now();
   const key = `otp_${number}`;
   const lastRequest = otpRateLimit.get(key);
   if (lastRequest && (now - lastRequest) < 60000) {
-    return res.status(429).send({ error: 'Please wait 60 seconds before requesting another OTP' });
+    return res.status(429).json({ error: 'Please wait 60 seconds before requesting another OTP' });
   }
   otpRateLimit.set(key, now);
   
   let newConfig;
-  try { newConfig = JSON.parse(configString); } catch (error) { return res.status(400).send({ error: 'Invalid config format' }); }
+  try { newConfig = JSON.parse(configString); } catch (error) { return res.status(400).json({ error: 'Invalid config format' }); }
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const socket = activeSockets.get(sanitizedNumber);
-  if (!socket) return res.status(404).send({ error: 'No active session found for this number' });
+  if (!socket) return res.status(404).json({ error: 'No active session found for this number' });
   const otp = generateOTP();
   otpStore.set(sanitizedNumber, { otp, expiry: Date.now() + config.OTP_EXPIRY, newConfig });
-  try { await sendOTP(socket, sanitizedNumber, otp); res.status(200).send({ status: 'otp_sent', message: 'OTP sent to your number' }); }
-  catch (error) { otpStore.delete(sanitizedNumber); res.status(500).send({ error: 'Failed to send OTP' }); }
+  try { await sendOTP(socket, sanitizedNumber, otp); res.status(200).json({ status: 'otp_sent', message: 'OTP sent to your number' }); }
+  catch (error) { otpStore.delete(sanitizedNumber); res.status(500).json({ error: 'Failed to send OTP' }); }
 });
 
 router.get('/verify-otp', async (req, res) => {
   const { number, otp } = req.query;
-  if (!number || !otp) return res.status(400).send({ error: 'Number and OTP are required' });
+  if (!number || !otp) return res.status(400).json({ error: 'Number and OTP are required' });
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const storedData = otpStore.get(sanitizedNumber);
-  if (!storedData) return res.status(400).send({ error: 'No OTP request found for this number' });
-  if (Date.now() >= storedData.expiry) { otpStore.delete(sanitizedNumber); return res.status(400).send({ error: 'OTP has expired' }); }
-  if (storedData.otp !== otp) return res.status(400).send({ error: 'Invalid OTP' });
+  if (!storedData) return res.status(400).json({ error: 'No OTP request found for this number' });
+  if (Date.now() >= storedData.expiry) { otpStore.delete(sanitizedNumber); return res.status(400).json({ error: 'OTP has expired' }); }
+  if (storedData.otp !== otp) return res.status(400).json({ error: 'Invalid OTP' });
   try {
     await setUserConfigInMongo(sanitizedNumber, storedData.newConfig);
     otpStore.delete(sanitizedNumber);
     const sock = activeSockets.get(sanitizedNumber);
     if (sock) await sock.sendMessage(jidNormalizedUser(sock.user.id), { image: { url: config.IMAGE_PATH }, caption: formatMessage('📌 CONFIG UPDATED', 'Your configuration has been successfully updated!', BOT_NAME_FANCY) });
-    res.status(200).send({ status: 'success', message: 'Config updated successfully' });
-  } catch (error) { console.error('Failed to update config:', error); res.status(500).send({ error: 'Failed to update config' }); }
+    res.status(200).json({ status: 'success', message: 'Config updated successfully' });
+  } catch (error) { console.error('Failed to update config:', error); res.status(500).json({ error: 'Failed to update config' }); }
 });
 
 router.get('/getabout', async (req, res) => {
   const { number, target } = req.query;
-  if (!number || !target) return res.status(400).send({ error: 'Number and target number are required' });
+  if (!number || !target) return res.status(400).json({ error: 'Number and target number are required' });
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const socket = activeSockets.get(sanitizedNumber);
-  if (!socket) return res.status(404).send({ error: 'No active session found for this number' });
+  if (!socket) return res.status(404).json({ error: 'No active session found for this number' });
   const targetJid = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
   try {
     const statusData = await socket.fetchStatus(targetJid);
     const aboutStatus = statusData.status || 'No status available';
     const setAt = statusData.setAt ? moment(statusData.setAt).tz('Asia/Colombo').format('YYYY-MM-DD HH:mm:ss') : 'Unknown';
-    res.status(200).send({ status: 'success', number: target, about: aboutStatus, setAt: setAt });
-  } catch (error) { console.error(`Failed to fetch status for ${target}:`, error); res.status(500).send({ status: 'error', message: `Failed to fetch About status for ${target}.` }); }
+    res.status(200).json({ status: 'success', number: target, about: aboutStatus, setAt: setAt });
+  } catch (error) { console.error(`Failed to fetch status for ${target}:`, error); res.status(500).json({ status: 'error', message: `Failed to fetch About status for ${target}.` }); }
 });
 
 // ==================== DASHBOARD ====================
@@ -1214,7 +1298,6 @@ router.post('/api/session/delete', async (req, res) => {
       socketCreationTime.delete(sanitized);
       pendingConnections.delete(sanitized);
       
-      // Remove all event handlers
       const handlersToRemove = [];
       for (const [key] of eventHandlersStore.entries()) {
         if (key.includes(sanitized)) {
@@ -1241,6 +1324,17 @@ router.get('/api/newsletters', async (req, res) => {
 router.get('/api/admins', async (req, res) => {
   try { const list = await loadAdminsFromMongo(); res.json({ ok: true, list }); } 
   catch (err) { res.status(500).json({ ok: false, error: err.message || err }); }
+});
+
+// ==================== ERROR HANDLING ====================
+router.use((err, req, res, next) => {
+  console.error('❌ Global error:', err);
+  if (!res.headersSent) {
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: err.message || 'Something went wrong'
+    });
+  }
 });
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -1278,6 +1372,7 @@ async function gracefulShutdown(signal) {
   otpStore.clear();
   userConfigCache.clear();
   eventHandlersStore.clear();
+  otpRateLimit.clear();
   
   if (mongoClient) {
     try {
@@ -1297,7 +1392,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
   console.error('🚨 Uncaught exception:', err);
-  try { exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
+  try { exec(`pm2 restart ${process.env.PM2_NAME || 'ZEUS-X-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
   setTimeout(() => process.exit(1), 5000);
 });
 
@@ -1306,23 +1401,35 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // ==================== INIT ====================
-initMongo().catch(err => console.warn('Mongo init failed at startup', err));
+(async () => {
+  try {
+    await initMongo();
+    console.log('✅ MongoDB initialized');
+  } catch (err) {
+    console.warn('⚠️ Mongo init failed at startup:', err.message);
+  }
+})();
 
 (async()=>{ 
   try { 
     const nums = await getAllNumbersFromMongo(); 
     if (nums && nums.length) { 
       console.log(`🔄 Auto-connecting ${nums.length} sessions...`);
+      let connected = 0;
       for (const n of nums) { 
         const sanitized = n.replace(/[^0-9]/g, '');
         if (!activeSockets.has(sanitized) && !pendingConnections.has(sanitized)) { 
           try { 
-            const mockRes = { headersSent:false, send:()=>{}, status:()=>mockRes }; 
+            const mockRes = { headersSent:false, json:()=>{}, status:()=>mockRes }; 
             await EmpirePair(n, mockRes); 
+            connected++;
             await delay(500); 
-          } catch(e) { console.error(`Failed to auto-connect ${n}:`, e.message); }
+          } catch(e) { 
+            console.error(`❌ Failed to auto-connect ${n}:`, e.message); 
+          }
         } 
-      } 
+      }
+      console.log(`✅ Auto-connected ${connected} sessions`);
     } 
   } catch(e){} 
 })();
@@ -1332,7 +1439,7 @@ initMongo().catch(err => console.warn('Mongo init failed at startup', err));
     await connectdb();
     await updb();
     console.log("✅ Settings DB Synced");
-  } catch (e) { console.error("Settings DB Error:", e); }
+  } catch (e) { console.error("❌ Settings DB Error:", e); }
 })();
 
 // ==================== EXPORT ====================
