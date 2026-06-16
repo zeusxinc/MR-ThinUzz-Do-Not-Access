@@ -522,8 +522,8 @@ async function extractMessageBodyFast(msg, sessionNumber) {
 }
 
 // ---------------- OPTIMIZED command handler ----------------
-const { findCommand } = require('./commandMap');
-const { commands } = require('./command');
+const { findCommand } = require('./lib/commandMap');
+const { commands } = require('./lib/command');
 
 function setupCommandHandlers(socket, number) {
   socket.ev.on('messages.upsert', async ({ messages }) => {
@@ -989,7 +989,7 @@ process.on('exit', () => {
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
-  try { exec(`pm2 restart ${process.env.PM2_NAME || 'ZEUS-X-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
+  try { exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
 });
 
 initMongo().catch(err => console.warn('Mongo init failed at startup', err));
