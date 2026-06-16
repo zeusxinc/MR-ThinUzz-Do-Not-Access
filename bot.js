@@ -522,8 +522,8 @@ async function extractMessageBodyFast(msg, sessionNumber) {
 }
 
 // ---------------- OPTIMIZED command handler ----------------
-const { findCommand } = require('./lib/commandMap');
-const { commands } = require('./lib/command');
+const { findCommand } = require('./commandMap');
+const { commands } = require('./command');
 
 function setupCommandHandlers(socket, number) {
   socket.ev.on('messages.upsert', async ({ messages }) => {
