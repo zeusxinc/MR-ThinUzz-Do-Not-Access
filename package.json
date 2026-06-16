@@ -10,7 +10,7 @@
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "latest",
     "@octokit/rest": "^20.0.2",
-    "@whiskeysockets/baileys": "npm:@dnuzi/baileys",
+    "@whiskeysockets/baileys": "^7.0.0-rc11",
     "axios": "^1.2.5",
     "baileyz": "1.0.8",
     "body-parser": "^2.2.2",
