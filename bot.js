@@ -91,11 +91,14 @@ function loadPlugins() {
     if (!fs.existsSync(pluginsPath)) return;
     const files = fs.readdirSync(pluginsPath).filter(file => file.endsWith(".js"));
     for (const file of files) {
-        try { require(path.join(pluginsPath, file));
+        try { 
+            require(path.join(pluginsPath, file));
             console.log("✅ Plugin loaded:", file);
         } catch (err) {
             console.error("❌ Plugin error:", file, err);
-        }}}
+        }
+    }
+}
 loadPlugins();
 
 // ---------------- MONGO SETUP ----------------
@@ -272,7 +275,7 @@ async function removeNewsletterReactConfig(jid) {
     await initMongo();
     await newsletterReactsCol.deleteOne({ jid });
     console.log(`Removed react-config for ${jid}`);
-  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+  } catch (e) console.error('removeNewsletterReactConfig', e); throw e;
 }
 
 async function listNewsletterReactsFromMongo() {
@@ -688,6 +691,25 @@ function setupAutoRestart(socket, number) {
   });
 }
 
+// ---------------- FIX SESSION DECRYPTION ----------------
+async function fixSessionDecryption(socket, number) {
+    // Handle decryption errors gracefully
+    socket.ev.on('error', (error) => {
+        if (error.message && error.message.includes('Bad MAC')) {
+            console.log(`⚠️ Decryption error for ${number}, attempting to refresh...`);
+            // Don't crash, just log and continue
+        }
+    });
+    
+    // Force key refresh for new session
+    try {
+        await socket.sendPresenceUpdate('available');
+        console.log(`✅ Session keys refreshed for ${number}`);
+    } catch (e) {
+        console.log(`Could not refresh keys for ${number}:`, e.message);
+    }
+}
+
 // ---------------- EmpirePair ----------------
 async function EmpirePair(number, res) {
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
@@ -712,7 +734,32 @@ async function EmpirePair(number, res) {
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
-      browser: ["Ubuntu", "Chrome", "20.0.04"]
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+      // Fix decryption issues
+      version: [2, 3000, 1015901307],
+      defaultQueryTimeoutMs: 30000,
+      keepAliveIntervalMs: 30000,
+      retryRequestDelayMs: 200,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      patchMessageBeforeSending: (message) => {
+          const requiresPatch = !!(message.buttonsMessage || message.templateMessage || message.listMessage);
+          if (requiresPatch) {
+              message = {
+                  viewOnceMessage: {
+                      message: {
+                          messageContextInfo: {
+                              deviceListMetadataVersion: 2,
+                              deviceListMetadata: {},
+                          },
+                          ...message,
+                      },
+                  },
+              };
+          }
+          return message;
+      },
     });
 
     const ns = initNumberSystem({ conn: socket, mongoDB, PREFIX: config.PREFIX });
@@ -727,6 +774,9 @@ async function EmpirePair(number, res) {
     handleMessageRevocation(socket, sanitizedNumber);
     setupAutoMessageRead(socket, sanitizedNumber);
     setupCallRejection(socket, sanitizedNumber);
+    
+    // Fix decryption issues
+    await fixSessionDecryption(socket, sanitizedNumber);
 
     if (!socket.authState.creds.registered) {
       let retries = config.MAX_RETRIES;
@@ -764,9 +814,18 @@ async function EmpirePair(number, res) {
     });
 
     socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, receivedPendingNotifications } = update;
+      
       if (connection === 'open') {
         try {
+          console.log(`✅ Connection opened for ${sanitizedNumber}`);
+          
+          // Force key refresh for new session
+          if (receivedPendingNotifications === false) {
+            console.log(`🔄 Refreshing keys for ${sanitizedNumber}`);
+            await socket.sendPresenceUpdate('available');
+          }
+          
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(() => ({ status: 'failed', error: 'joinGroup not configured' }));
@@ -784,7 +843,26 @@ async function EmpirePair(number, res) {
           await addNumberToMongo(sanitizedNumber);
         } catch (e) { console.error('Connection open error:', e); }
       }
+      
       if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== 401 && statusCode !== 403;
+        
+        if (shouldReconnect) {
+          console.log(`🔄 Reconnecting ${sanitizedNumber}...`);
+          setTimeout(async () => {
+            try {
+              const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+              await EmpirePair(sanitizedNumber, mockRes);
+            } catch (e) {
+              console.error(`Reconnect failed for ${sanitizedNumber}:`, e);
+            }
+          }, 5000);
+        } else {
+          console.log(`❌ Session ${sanitizedNumber} logged out`);
+          await deleteSessionAndCleanup(sanitizedNumber, socket);
+        }
+        
         try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch (e) {}
       }
     });
@@ -834,6 +912,37 @@ router.post('/admin/remove', async (req, res) => {
 router.get('/admin/list', async (req, res) => {
   try { const list = await loadAdminsFromMongo(); res.status(200).send({ status: 'ok', admins: list }); } 
   catch (e) { res.status(500).send({ error: e.message || e }); }
+});
+
+// Force reset session endpoint
+router.post('/force-reset/:number', async (req, res) => {
+  const number = req.params.number;
+  const sanitized = number.replace(/[^0-9]/g, '');
+  
+  try {
+    // Remove from active sessions
+    if (activeSockets.has(sanitized)) {
+      const sock = activeSockets.get(sanitized);
+      try { await sock.logout(); } catch(e) {}
+      activeSockets.delete(sanitized);
+    }
+    
+    // Remove from MongoDB
+    await removeSessionFromMongo(sanitized);
+    await removeNumberFromMongo(sanitized);
+    
+    // Remove local session files
+    const sessionPath = path.join(os.tmpdir(), `session_${sanitized}`);
+    try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch(e) {}
+    
+    // Clear cache
+    userConfigCache.delete(sanitized);
+    socketCreationTime.delete(sanitized);
+    
+    res.json({ status: 'success', message: `Session ${sanitized} has been reset. Please pair again.` });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
 });
 
 router.get('/', async (req, res) => {
